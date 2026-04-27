@@ -1,0 +1,24 @@
+name: Video-XL-2
+type: composite
+components:
+  - name: visual
+    type: visual_encoder
+    source: BAAI/Video-XL-2-visual
+  - name: language
+    type: llm
+    source: meta-llama/Llama-3-8B
+modalities:
+  - video
+  - text
+input_format: "<video> {question}"
+output_type: free_text
+min_examples_for_soft_prompt: 50
+recommended_annotation_style: qa_pairs
+soft_prompt_guide: |
+  Для видео формулируйте вопросы по конкретным моментам времени.
+  При сохранении аннотации система добавит timestamp в дополнительные данные.
+coop_supported: true
+coop_default_num_vectors: 16
+coop_context_init: "a video of"
+class_token_position: end
+coop_net_depth: 3

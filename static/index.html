@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>AutoPrompt Annotator 5.0</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>AutoPrompt Annotator 5.0</h1>
+    <div class="header-actions">
+      <button id="tour-btn" title="Тур по интерфейсу">Тур</button>
+      <button id="help-btn" title="Режим помощи (?)">?</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- LEFT: upload + model -->
+    <section id="left-panel">
+      <h2>1. Файлы</h2>
+      <div id="upload-area" class="upload-area">
+        <p id="upload-hint">Загрузка…</p>
+        <div id="upload-windows" class="hidden">
+          <input type="file" id="file-input" multiple>
+          <div id="dropzone">Перетащите файлы сюда</div>
+        </div>
+        <div id="upload-linux" class="hidden">
+          <textarea id="paths-input" placeholder="Один путь на строку"></textarea>
+          <button id="upload-paths-btn">Загрузить пути</button>
+        </div>
+      </div>
+      <ul id="file-list"></ul>
+
+      <h2>2. Модель</h2>
+      <select id="model-select"></select>
+      <details>
+        <summary>Сгенерировать новую через GigaChat</summary>
+        <input id="model-id-input" placeholder="Идентификатор / описание модели">
+        <button id="generate-config-btn">Сгенерировать конфиг</button>
+        <textarea id="generated-yaml" rows="10" placeholder="YAML появится здесь"></textarea>
+        <input id="save-name" placeholder="Имя модели для сохранения">
+        <button id="save-config-btn">Сохранить</button>
+      </details>
+
+      <h2>3. Сессия</h2>
+      <input id="dataset-name" placeholder="Имя датасета">
+      <button id="start-session-btn">Начать разметку</button>
+      <div id="session-progress"></div>
+      <button id="finalize-session-btn" class="hidden">Завершить и сохранить датасет</button>
+    </section>
+
+    <!-- CENTER: viewer + bbox -->
+    <section id="center-panel">
+      <h2>Просмотр</h2>
+      <div id="viewer">
+        <video id="video-player" controls class="hidden"></video>
+        <div id="image-wrap" class="hidden">
+          <img id="image-view" alt="">
+          <canvas id="bbox-canvas"></canvas>
+        </div>
+        <pre id="text-view" class="hidden"></pre>
+      </div>
+
+      <div id="video-tools" class="hidden">
+        <button id="timestamp-btn">Вставить время</button>
+        <button id="export-video-btn">Экспортировать с таймкодом</button>
+      </div>
+
+      <div id="bbox-tools" class="hidden">
+        <input id="bbox-class" placeholder="класс">
+        <select id="bbox-format">
+          <option value="yolo">YOLO</option>
+          <option value="coco">COCO</option>
+          <option value="voc">Pascal VOC</option>
+        </select>
+        <button id="bbox-save-btn">Сохранить разметку</button>
+        <button id="bbox-clear-btn">Очистить</button>
+      </div>
+    </section>
+
+    <!-- RIGHT: annotation form + extras -->
+    <section id="right-panel">
+      <h2>Разметка</h2>
+      <form id="annotate-form">
+        <textarea id="question" placeholder="Вопрос" rows="3"></textarea>
+        <textarea id="answer" placeholder="Ответ" rows="3"></textarea>
+        <div class="row">
+          <button type="button" id="check-prompt-btn">Проверить (GigaChat)</button>
+          <button type="button" id="improve-prompt-btn">Улучшить вопрос</button>
+        </div>
+        <div id="check-result"></div>
+        <button type="submit">Сохранить и далее</button>
+      </form>
+
+      <h2>CoOp / CoCoOp</h2>
+      <div class="row">
+        <select id="coop-type">
+          <option value="coop">CoOp</option>
+          <option value="cocoop">CoCoOp</option>
+        </select>
+        <input id="coop-num-vectors" type="number" value="16" min="1">
+      </div>
+      <input id="coop-context-init" value="a photo of a">
+      <button id="coop-train-btn">Запустить обучение</button>
+      <pre id="coop-log"></pre>
+
+      <h2>Бенчмарк</h2>
+      <textarea id="bench-questions" placeholder="вопросы (одно на строку)" rows="3"></textarea>
+      <textarea id="bench-before" placeholder="ответы ДО" rows="3"></textarea>
+      <textarea id="bench-after" placeholder="ответы ПОСЛЕ" rows="3"></textarea>
+      <button id="benchmark-btn">Сравнить</button>
+      <pre id="bench-result"></pre>
+    </section>
+  </main>
+
+  <div id="help-tooltip" class="hidden"></div>
+  <div id="tour-overlay" class="hidden"></div>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>

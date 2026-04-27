@@ -1,0 +1,19 @@
+name: ExampleModel
+type: monolithic
+modalities:
+  - image
+  - text
+input_format: "<image> {question}"
+output_type: free_text
+min_examples_for_soft_prompt: 30
+recommended_annotation_style: qa_pairs
+soft_prompt_guide: |
+  Используйте конкретные вопросы по содержимому изображения.
+  Пример:
+    Q: "Сколько людей на фото?"
+    A: "3"
+coop_supported: true
+coop_default_num_vectors: 16
+coop_context_init: "a photo of a"
+class_token_position: end
+coop_net_depth: 3
