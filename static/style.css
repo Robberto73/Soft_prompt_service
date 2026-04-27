@@ -1,0 +1,74 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0; font-family: system-ui, sans-serif; background: #f6f7fb; color: #1f2330;
+}
+header {
+  background: #1f2937; color: white; padding: 12px 20px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+header h1 { font-size: 18px; margin: 0; }
+.header-actions button {
+  margin-left: 8px; background: #374151; color: white; border: 0;
+  padding: 6px 12px; border-radius: 4px; cursor: pointer;
+}
+main {
+  display: grid; grid-template-columns: 320px 1fr 360px; gap: 12px; padding: 12px;
+}
+section {
+  background: white; border-radius: 8px; padding: 12px;
+  box-shadow: 0 1px 4px rgba(0,0,0,.05); overflow: auto; max-height: calc(100vh - 80px);
+}
+h2 { font-size: 14px; margin: 14px 0 6px; color: #374151; text-transform: uppercase; letter-spacing: .5px; }
+input, select, textarea, button {
+  width: 100%; padding: 6px 8px; margin: 4px 0; font-size: 13px;
+  border: 1px solid #d1d5db; border-radius: 4px;
+}
+button { background: #2563eb; color: white; border: 0; cursor: pointer; }
+button:hover { background: #1d4ed8; }
+button.secondary { background: #6b7280; }
+.row { display: flex; gap: 6px; }
+.row > * { flex: 1; }
+.hidden { display: none !important; }
+.upload-area { border: 2px dashed #cbd5e1; padding: 12px; border-radius: 6px; }
+#dropzone {
+  margin-top: 6px; padding: 18px; text-align: center;
+  background: #f1f5f9; border-radius: 4px; color: #64748b;
+}
+#file-list {
+  list-style: none; padding: 0; margin: 6px 0; max-height: 160px; overflow: auto;
+}
+#file-list li {
+  padding: 4px 6px; border-bottom: 1px solid #e5e7eb; font-size: 12px;
+  display: flex; justify-content: space-between;
+}
+#file-list li.selected { background: #eff6ff; }
+#viewer {
+  background: #0f172a; border-radius: 6px; min-height: 300px;
+  display: flex; align-items: center; justify-content: center; padding: 8px;
+  position: relative;
+}
+#video-player, #image-view { max-width: 100%; max-height: 480px; }
+#image-wrap { position: relative; }
+#bbox-canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
+#text-view {
+  background: white; color: black; max-width: 100%; max-height: 480px; overflow: auto;
+  padding: 8px; font-family: ui-monospace, monospace; font-size: 12px; width: 100%;
+}
+#help-tooltip {
+  position: fixed; background: #111827; color: white; padding: 12px;
+  border-radius: 6px; max-width: 320px; z-index: 999; font-size: 12px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.3);
+}
+body.help-mode { cursor: help; }
+body.help-mode * { cursor: help !important; }
+#tour-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 998;
+  display: flex; align-items: center; justify-content: center;
+}
+.tour-card {
+  background: white; padding: 18px; border-radius: 8px; max-width: 420px;
+}
+pre { background: #f3f4f6; padding: 8px; border-radius: 4px; max-height: 200px; overflow: auto; font-size: 11px; }
+#check-result { font-size: 12px; padding: 6px; }
+#check-result.ok { color: #047857; }
+#check-result.bad { color: #b91c1c; }

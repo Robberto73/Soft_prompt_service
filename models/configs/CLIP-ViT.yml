@@ -1,0 +1,17 @@
+name: CLIP-ViT
+type: monolithic
+modalities:
+  - image
+  - text
+input_format: "<image> {question}"
+output_type: classification
+min_examples_for_soft_prompt: 30
+recommended_annotation_style: image_class
+soft_prompt_guide: |
+  Для CLIP формулируйте короткие вопросы вида "Что изображено?"
+  Ответ — название класса одним словом.
+coop_supported: true
+coop_default_num_vectors: 16
+coop_context_init: "a photo of a"
+class_token_position: end
+coop_net_depth: 3
