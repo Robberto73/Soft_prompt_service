@@ -1,12 +1,13 @@
 """Launch CoOp/CoCoOp training as a subprocess and inspect its status.
 
 The actual training is a stub script (see `templates/`); the control
-plane (start, status, logs, output dir) is real.
+plane (start, status, logs, output dir, run metadata) is real.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from datetime import datetime
@@ -54,6 +55,22 @@ async def run_coop_training(
         f"started_at={datetime.utcnow().isoformat()}\nscript={script_path}\n",
         encoding="utf-8",
     )
+    run_meta = {
+        "run_id": out.name,
+        "model_name": model_config.name,
+        "dataset_path": str(dataset_path),
+        "coop_type": coop_type,
+        "num_vectors": int(num_vectors),
+        "context_init": context_init,
+        "class_token_position": class_token_position,
+        "net_depth": int(net_depth),
+        "started_at": datetime.utcnow().isoformat(),
+        "script": str(script_path),
+    }
+    (out / "run.json").write_text(
+        json.dumps(run_meta, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     log_handle = open(log_file, "a", encoding="utf-8")
     proc = await asyncio.create_subprocess_exec(
@@ -90,6 +107,26 @@ async def _wait_and_finalize(output_dir: str, proc, log_handle) -> None:
     _running.pop(output_dir, None)
 
 
+def _read_metrics(out: Path) -> dict | None:
+    metrics_file = out / "metrics.json"
+    if not metrics_file.exists():
+        return None
+    try:
+        return json.loads(metrics_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _read_run_meta(out: Path) -> dict:
+    meta_file = out / "run.json"
+    if not meta_file.exists():
+        return {}
+    try:
+        return json.loads(meta_file.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def get_coop_status(output_dir: str) -> dict:
     out = Path(output_dir)
     log_file = out / "train.log"
@@ -101,18 +138,90 @@ def get_coop_status(output_dir: str) -> dict:
             log_tail = "\n".join(text.splitlines()[-30:])
         except Exception:
             log_tail = ""
+    metrics = _read_metrics(out)
+    meta = _read_run_meta(out)
+    has_vectors = (out / "prompt_vectors.bin").exists()
+
+    base = {
+        "log": log_tail,
+        "output_dir": str(out),
+        "metrics": metrics,
+        "meta": meta,
+        "has_vectors": has_vectors,
+    }
     if not lock_file.exists():
-        return {"status": "unknown", "log": log_tail, "output_dir": str(out)}
+        return {"status": "unknown", **base}
     lock_text = lock_file.read_text(encoding="utf-8", errors="replace")
     if "status=" in lock_text:
         for line in lock_text.splitlines():
             if line.startswith("status="):
-                return {
-                    "status": line.split("=", 1)[1].strip(),
-                    "log": log_tail,
-                    "output_dir": str(out),
-                }
-    return {"status": "running", "log": log_tail, "output_dir": str(out)}
+                return {"status": line.split("=", 1)[1].strip(), **base}
+    return {"status": "running", **base}
+
+
+def list_coop_runs(limit: int = 50) -> list[dict]:
+    """Scan COOP_OUTPUTS for past runs, newest first."""
+    if not COOP_OUTPUTS.exists():
+        return []
+    runs: list[dict] = []
+    for d in COOP_OUTPUTS.iterdir():
+        if not d.is_dir():
+            continue
+        meta = _read_run_meta(d)
+        metrics = _read_metrics(d)
+        status = get_coop_status(str(d))["status"]
+        try:
+            mtime = d.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        runs.append({
+            "run_id": d.name,
+            "output_dir": str(d),
+            "status": status,
+            "started_at": meta.get("started_at"),
+            "model_name": meta.get("model_name"),
+            "dataset_path": meta.get("dataset_path"),
+            "coop_type": meta.get("coop_type"),
+            "num_vectors": meta.get("num_vectors"),
+            "context_init": meta.get("context_init"),
+            "metrics": metrics,
+            "has_vectors": (d / "prompt_vectors.bin").exists(),
+            "mtime": mtime,
+        })
+    runs.sort(key=lambda r: r["mtime"], reverse=True)
+    return runs[:limit]
+
+
+async def cancel_coop_run(output_dir: str) -> dict:
+    """Terminate a running training subprocess if it is still alive.
+
+    Best-effort: signals the process and updates the lock file. If awaiting
+    the subprocess fails (e.g. the call comes from a different event loop
+    than the one that spawned it — the TestClient case), we still mark
+    the run as cancelled so the UI reflects the user's intent.
+    """
+    proc = _running.get(output_dir)
+    if not proc:
+        return {"status": "not_running", "output_dir": output_dir}
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+    except (asyncio.TimeoutError, RuntimeError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "run.lock").write_text(
+        f"finished_at={datetime.utcnow().isoformat()}\nstatus=cancelled\n",
+        encoding="utf-8",
+    )
+    _running.pop(output_dir, None)
+    return {"status": "cancelled", "output_dir": output_dir}
 
 
 def apply_learned_prompt(

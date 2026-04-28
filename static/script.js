@@ -26,21 +26,46 @@ const TOUR_STEPS = [
 const PALETTE = ["#ef4444", "#22c55e", "#3b82f6", "#eab308", "#a855f7", "#ec4899", "#14b8a6", "#f97316"];
 
 // ---------- API helper ----------
+// Resolve the proxy prefix from the page URL once. If the page is loaded
+// at https://host/user/me/proxy/5000/, API_BASE becomes
+// "/user/me/proxy/5000/" and every API call is prefixed with it.
+// This makes the frontend work behind JupyterHub / nginx without
+// hard-coding paths.
+const API_BASE = new URL("./", document.baseURI).pathname;
+
+function apiURL(path) {
+  return API_BASE + String(path).replace(/^\/+/, "");
+}
+
 async function api(path, opts = {}) {
   const init = { headers: {}, ...opts };
   if (opts.body && !(opts.body instanceof FormData) && typeof opts.body !== "string") {
     init.body = JSON.stringify(opts.body);
     init.headers["Content-Type"] = "application/json";
   }
-  const res = await fetch(path, init);
+  const url = apiURL(path);
+  const res = await fetch(url, init);
+  const ct = (res.headers.get("content-type") || "").toLowerCase();
+  const isJSON = ct.includes("application/json");
   const text = await res.text();
-  let data;
-  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+  let data = null;
+  if (isJSON && text) { try { data = JSON.parse(text); } catch {} }
   if (!res.ok) {
-    const msg = data.detail || data.message || text || res.statusText;
+    if (!isJSON) {
+      // The response is not JSON — almost certainly we hit a reverse
+      // proxy (JupyterHub / nginx) that did not forward the request to
+      // the backend. Surface a short, actionable message instead of the
+      // entire HTML error page.
+      throw new Error(
+        `HTTP ${res.status}: запрос на ${url} не дошёл до сервиса. ` +
+        `Похоже, ответил прокси (JupyterHub/nginx). ` +
+        `Проверьте префикс: запустите бэкенд с APP_ROOT_PATH, либо откройте страницу под правильным URL.`
+      );
+    }
+    const msg = (data && (data.detail || data.message)) || res.statusText || `HTTP ${res.status}`;
     throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
   }
-  return data;
+  return data || {};
 }
 
 const fmtTimestamp = (ts) => {
@@ -101,6 +126,30 @@ const App = {
     const canvasRef = ref(null);
     const imageRef = ref(null);
 
+    // class history per project (persisted in localStorage)
+    const classHistory = ref([]);
+    const CLASS_KEY = (p) => `class_history:${p}`;
+    function loadClassHistory(proj) {
+      if (!proj) { classHistory.value = []; return; }
+      try {
+        const raw = localStorage.getItem(CLASS_KEY(proj));
+        classHistory.value = raw ? JSON.parse(raw) : [];
+      } catch { classHistory.value = []; }
+    }
+    function saveClassHistory() {
+      if (!activeProject.value) return;
+      localStorage.setItem(CLASS_KEY(activeProject.value), JSON.stringify(classHistory.value));
+    }
+    function recordClass(name) {
+      const c = String(name || "").trim();
+      if (!c) return;
+      const idx = classHistory.value.indexOf(c);
+      if (idx !== -1) classHistory.value.splice(idx, 1);
+      classHistory.value.unshift(c);
+      if (classHistory.value.length > 50) classHistory.value.length = 50;
+      saveClassHistory();
+    }
+
     // video
     const videoRef = ref(null);
     const videoTime = ref(0);
@@ -109,8 +158,19 @@ const App = {
     const coopType = ref("coop");
     const coopNumVectors = ref(16);
     const coopContextInit = ref("a photo of a");
+    const coopClassPos = ref("end");
+    const coopNetDepth = ref(3);
     const coopRunId = ref(null);
+    const coopStatus = ref("idle");
     const coopLog = ref("(пока пусто)");
+    const coopMetrics = ref(null);
+    const coopOutputDir = ref("");
+    const coopHasVectors = ref(false);
+    const coopRuns = reactive([]);
+    const coopDatasets = reactive([]);
+    const coopDataset = ref("");
+    const coopShowTheory = ref(false);
+    const coopModelInfo = ref(null);
     let coopTimer = null;
 
     // benchmark
@@ -133,7 +193,65 @@ const App = {
       selectedFileId.value != null
         ? files.find(f => f.file_id === selectedFileId.value) : null
     );
-    const fileURL = (id) => `/files/${id}`;
+    const fileURL = (id) => apiURL(`files/${id}`);
+
+    // Gallery: media files in active project (image + video)
+    const galleryFiles = computed(() => files.filter(f => f.type === "image" || f.type === "video"));
+    const galleryIndex = computed(() => {
+      if (!selectedFile.value) return -1;
+      return galleryFiles.value.findIndex(f => f.file_id === selectedFile.value.file_id);
+    });
+
+    // Distinct classes used in current shapes — for the dropdown + rename helper
+    const usedClasses = computed(() => {
+      const counts = {};
+      for (const s of shapes) {
+        const c = s.class || "object";
+        counts[c] = (counts[c] || 0) + 1;
+      }
+      return Object.entries(counts).map(([name, count]) => ({ name, count }));
+    });
+
+    // Combined dropdown options: history + currently used (no dups, history first)
+    const knownClasses = computed(() => {
+      const out = [];
+      const seen = new Set();
+      for (const c of classHistory.value) {
+        if (!seen.has(c)) { out.push(c); seen.add(c); }
+      }
+      for (const u of usedClasses.value) {
+        if (!seen.has(u.name)) { out.push(u.name); seen.add(u.name); }
+      }
+      return out;
+    });
+
+    function gotoGallery(delta) {
+      const arr = galleryFiles.value;
+      if (!arr.length) return;
+      const i = galleryIndex.value;
+      if (i === -1) { selectFile(arr[0].file_id); return; }
+      const next = (i + delta + arr.length) % arr.length;
+      selectFile(arr[next].file_id);
+    }
+
+    // Inline rename of a single layer's class — save into history when changed
+    function onLayerClassChange(idx, newValue) {
+      const c = String(newValue || "").trim() || "object";
+      shapes[idx].class = c;
+      recordClass(c);
+      drawAll();
+    }
+
+    // Bulk rename: change every shape with class `oldName` to `newName`
+    function renameClass(oldName) {
+      const newName = prompt(`Переименовать класс «${oldName}» во всех слоях:`, oldName);
+      if (!newName || newName === oldName) return;
+      const trimmed = newName.trim();
+      if (!trimmed) return;
+      for (const s of shapes) if (s.class === oldName) s.class = trimmed;
+      recordClass(trimmed);
+      drawAll();
+    }
 
     function setError(msg)  { errorMsg.value = msg; setTimeout(() => errorMsg.value = "", 6000); }
     function setNotice(msg) { noticeMsg.value = msg; setTimeout(() => noticeMsg.value = "", 4000); }
@@ -212,6 +330,7 @@ const App = {
       selectedFileId.value = null;
       shapes.splice(0, shapes.length);
       polyDraft.splice(0, polyDraft.length);
+      loadClassHistory(name);
       // load existing files for this project
       try {
         const r = await api(`/projects/${encodeURIComponent(name)}/files`);
@@ -231,11 +350,20 @@ const App = {
     async function loadModelInfo() {
       if (!selectedModel.value) return;
       try {
-        const g = await api(`/models/soft_prompt_guide/${encodeURIComponent(selectedModel.value)}`);
-        modelGuide.value = g.guide || "";
-        const m = await api(`/models/min_examples/${encodeURIComponent(selectedModel.value)}`);
-        modelMinExamples.value = m.min_examples;
-      } catch { modelGuide.value = ""; modelMinExamples.value = null; }
+        const info = await api(`/models/info/${encodeURIComponent(selectedModel.value)}`);
+        coopModelInfo.value = info;
+        modelGuide.value = info.soft_prompt_guide || "";
+        modelMinExamples.value = info.min_examples_for_soft_prompt;
+        // Sync CoOp defaults from the model YAML.
+        if (info.coop_default_num_vectors) coopNumVectors.value = info.coop_default_num_vectors;
+        if (info.coop_context_init) coopContextInit.value = info.coop_context_init;
+        if (info.class_token_position) coopClassPos.value = info.class_token_position;
+        if (info.coop_net_depth) coopNetDepth.value = info.coop_net_depth;
+      } catch {
+        coopModelInfo.value = null;
+        modelGuide.value = "";
+        modelMinExamples.value = null;
+      }
     }
     watch(selectedModel, loadModelInfo);
 
@@ -410,11 +538,9 @@ const App = {
       if (tool.value !== "bbox" || !drawing.value) return;
       const d = drawing.value;
       if (Math.abs(d.x2 - d.x1) > 4 && Math.abs(d.y2 - d.y1) > 4) {
-        shapes.push({
-          kind: "bbox",
-          class: shapeClass.value || "object",
-          x1: d.x1, y1: d.y1, x2: d.x2, y2: d.y2,
-        });
+        const cls = shapeClass.value || "object";
+        shapes.push({ kind: "bbox", class: cls, x1: d.x1, y1: d.y1, x2: d.x2, y2: d.y2 });
+        recordClass(cls);
       }
       drawing.value = null;
       drawAll();
@@ -445,11 +571,13 @@ const App = {
         drawAll();
         return;
       }
+      const cls = shapeClass.value || "object";
       shapes.push({
         kind: "polygon",
-        class: shapeClass.value || "object",
+        class: cls,
         points: polyDraft.map(p => [...p]),
       });
+      recordClass(cls);
       polyDraft.splice(0, polyDraft.length);
       polyHover.value = null;
       drawAll();
@@ -628,34 +756,128 @@ const App = {
     }
 
     // ----- coop -----
+    const coopSupported = computed(() =>
+      !!(coopModelInfo.value && coopModelInfo.value.coop_supported)
+    );
+
+    async function loadCoopDatasets() {
+      try {
+        const proj = activeProject.value || "";
+        const r = await api(`/datasets/list?project=${encodeURIComponent(proj)}`);
+        coopDatasets.splice(0, coopDatasets.length, ...r.datasets);
+        if (!coopDataset.value && coopDatasets.length) {
+          coopDataset.value = coopDatasets[0].name;
+        } else if (coopDataset.value && !coopDatasets.find(d => d.name === coopDataset.value)) {
+          coopDataset.value = coopDatasets[0]?.name || "";
+        }
+      } catch (e) { /* keep silent: empty dataset list is OK */ }
+    }
+
+    async function loadCoopRuns() {
+      try {
+        const r = await api("/coop/runs");
+        coopRuns.splice(0, coopRuns.length, ...r.runs);
+      } catch { coopRuns.splice(0, coopRuns.length); }
+    }
+
     async function trainCoop() {
       if (!selectedModel.value) return setError("Выберите модель.");
+      if (!coopSupported.value) {
+        return setError(`Модель «${selectedModel.value}» не поддерживает CoOp/CoCoOp. Установите coop_supported: true в YAML.`);
+      }
+      if (!coopDataset.value) return setError("Выберите датасет (.jsonl) — список ниже.");
       try {
         const r = await api("/coop/train", {
           method: "POST",
           body: {
             model_name: selectedModel.value,
-            dataset_name: datasetName.value || "dataset",
+            dataset_name: coopDataset.value,
             coop_type: coopType.value,
             num_vectors: +coopNumVectors.value,
             context_init: coopContextInit.value,
-            class_token_position: "end",
-            net_depth: 3,
+            class_token_position: coopClassPos.value,
+            net_depth: +coopNetDepth.value,
+            project: activeProject.value,
           },
         });
         coopRunId.value = r.run_id;
+        coopOutputDir.value = r.output_dir || "";
+        coopStatus.value = "running";
+        coopMetrics.value = null;
+        coopHasVectors.value = false;
         coopLog.value = `Запущено: ${r.run_id}\noutput_dir: ${r.output_dir}\n`;
         if (coopTimer) clearTimeout(coopTimer);
         pollCoop();
+        loadCoopRuns();
+        setNotice("Обучение запущено: " + r.run_id);
       } catch (e) { setError(e.message); }
     }
+
     async function pollCoop() {
       if (!coopRunId.value) return;
       try {
         const r = await api(`/coop/status/${coopRunId.value}`);
-        coopLog.value = `[${r.status}]\n${r.log}`;
-        if (r.status === "running") coopTimer = setTimeout(pollCoop, 1500);
-      } catch (e) { coopLog.value = "ошибка: " + e.message; }
+        coopStatus.value = r.status;
+        coopLog.value = r.log || "(лог пуст)";
+        coopMetrics.value = r.metrics || null;
+        coopHasVectors.value = !!r.has_vectors;
+        coopOutputDir.value = r.output_dir || coopOutputDir.value;
+        if (r.status === "running") {
+          coopTimer = setTimeout(pollCoop, 1500);
+        } else {
+          loadCoopRuns();
+        }
+      } catch (e) {
+        coopStatus.value = "error";
+        coopLog.value = "ошибка опроса: " + e.message;
+      }
+    }
+
+    async function cancelCoop() {
+      if (!coopRunId.value) return;
+      if (!confirm(`Прервать запуск ${coopRunId.value}?`)) return;
+      try {
+        await api(`/coop/cancel/${coopRunId.value}`, { method: "POST" });
+        setNotice("Отменено: " + coopRunId.value);
+        if (coopTimer) clearTimeout(coopTimer);
+        pollCoop();
+      } catch (e) { setError(e.message); }
+    }
+
+    async function applyCoopVectors() {
+      if (!coopRunId.value) return setError("Сначала выберите run.");
+      if (!selectedModel.value) return setError("Выберите модель.");
+      try {
+        const r = await api("/coop/apply", {
+          method: "POST",
+          body: { model_name: selectedModel.value, run_id: coopRunId.value },
+        });
+        setNotice(`Применены векторы для «${r.model}».`);
+      } catch (e) { setError(e.message); }
+    }
+
+    function selectCoopRun(run) {
+      coopRunId.value = run.run_id;
+      coopStatus.value = run.status;
+      coopOutputDir.value = run.output_dir || "";
+      coopMetrics.value = run.metrics || null;
+      coopHasVectors.value = !!run.has_vectors;
+      coopLog.value = "(загрузка...)";
+      if (coopTimer) clearTimeout(coopTimer);
+      pollCoop();
+    }
+
+    function fmtCoopStatus(s) {
+      const labels = {
+        running: "выполняется",
+        completed: "успешно",
+        failed: "ошибка",
+        cancelled: "отменено",
+        unknown: "—",
+        idle: "не запущено",
+        error: "ошибка опроса",
+      };
+      return labels[s] || s || "—";
     }
 
     // ----- benchmark -----
@@ -715,10 +937,29 @@ const App = {
         if (e.key === "Escape") {
           helpMode.value = false; helpTooltip.value = null; tourIndex.value = -1;
           if (tool.value === "polygon") cancelPolygon();
+          return;
         }
+        // Gallery navigation: arrows only when annotate tab is active
+        // and focus is not in an input/textarea.
+        if (activeTab.value !== "annotate") return;
+        const t = e.target;
+        const tag = (t && t.tagName) || "";
+        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+        if (e.key === "ArrowLeft") { gotoGallery(-1); e.preventDefault(); }
+        else if (e.key === "ArrowRight") { gotoGallery(1); e.preventDefault(); }
       });
     });
     onUnmounted(() => { if (coopTimer) clearTimeout(coopTimer); });
+
+    watch(activeTab, (v) => {
+      if (v === "coop") {
+        loadCoopDatasets();
+        loadCoopRuns();
+      }
+    });
+    watch(activeProject, () => {
+      if (activeTab.value === "coop") loadCoopDatasets();
+    });
 
     function onImageLoad() { syncCanvasSize(); }
 
@@ -733,9 +974,12 @@ const App = {
       modelIdInput, generatedYaml, saveName,
       datasetName, sessionId, sessionProgress, question, answer, checkResult,
       shapes, tool, shapeClass, exportFormat, polyDraft,
+      classHistory, knownClasses, usedClasses, galleryFiles, galleryIndex,
       canvasRef, imageRef,
       videoRef, videoTime,
-      coopType, coopNumVectors, coopContextInit, coopRunId, coopLog,
+      coopType, coopNumVectors, coopContextInit, coopClassPos, coopNetDepth,
+      coopRunId, coopLog, coopStatus, coopMetrics, coopOutputDir, coopHasVectors,
+      coopRuns, coopDatasets, coopDataset, coopShowTheory, coopModelInfo, coopSupported,
       benchQuestions, benchBefore, benchAfter, benchResult,
       helpMode, helpTooltip, tourIndex,
       textContent,
@@ -748,10 +992,13 @@ const App = {
       onCanvasMouseDown, onCanvasMouseMove, onCanvasMouseUp,
       onCanvasClick, onCanvasDblClick, finishPolygon, cancelPolygon,
       removeShape, clearShapes, highlightShape, unhighlight, saveShapes,
+      onLayerClassChange, renameClass, gotoGallery,
       insertTimestamp, exportVideoTimestamp,
       generateConfig, saveConfig,
       startSession, checkPrompt, improvePrompt, submitAnnotation, finalizeSession,
-      trainCoop, runBenchmark,
+      trainCoop, cancelCoop, applyCoopVectors, selectCoopRun,
+      loadCoopDatasets, loadCoopRuns, fmtCoopStatus,
+      runBenchmark,
       toggleHelpMode, showHelpFor, startTour, nextTour, closeTour,
       onImageLoad,
       tourStep: computed(() => tourIndex.value >= 0 ? TOUR_STEPS[tourIndex.value] : null),
@@ -927,6 +1174,10 @@ const App = {
 
       <!-- ====== ANNOTATE ====== -->
       <div v-show="activeTab === 'annotate'">
+        <datalist id="class-options">
+          <option v-for="c in knownClasses" :key="c" :value="c"></option>
+        </datalist>
+
         <div class="card">
           <div class="row between">
             <div class="row" style="flex: 1;">
@@ -938,9 +1189,37 @@ const App = {
           </div>
         </div>
 
-        <div class="grid annotate">
+        <div class="grid annotate-3">
+          <!-- LEFT: gallery -->
+          <aside class="card gallery-card">
+            <h2>Галерея <span class="badge-pill">{{ galleryFiles.length }}</span></h2>
+            <p v-if="!galleryFiles.length" class="hint">Нет изображений/видео в проекте.</p>
+            <ul class="gallery">
+              <li v-for="(f, i) in galleryFiles" :key="f.file_id"
+                  class="gallery-item"
+                  :class="{ selected: selectedFileId === f.file_id }"
+                  @click="selectFile(f.file_id)"
+                  :title="baseName(f.path)">
+                <div class="gallery-num">{{ i + 1 }}</div>
+                <div class="gallery-thumb">
+                  <img v-if="f.type === 'image'" :src="fileURL(f.file_id)" alt="">
+                  <video v-else-if="f.type === 'video'" :src="fileURL(f.file_id)" muted preload="metadata"></video>
+                </div>
+                <div class="gallery-name">{{ baseName(f.path) }}</div>
+              </li>
+            </ul>
+          </aside>
+
+          <!-- CENTER: viewer -->
           <div class="card">
-            <h2>Просмотр {{ selectedFile ? '— ' + baseName(selectedFile.path) : '' }}</h2>
+            <div class="row between" style="margin-bottom: 12px;">
+              <h2 style="margin: 0;">{{ selectedFile ? baseName(selectedFile.path) : 'Просмотр' }}</h2>
+              <div class="row" v-if="galleryFiles.length">
+                <button class="ghost" @click="gotoGallery(-1)" title="Предыдущий (←)">‹</button>
+                <span class="muted small">{{ galleryIndex + 1 }} / {{ galleryFiles.length }}</span>
+                <button class="ghost" @click="gotoGallery(1)" title="Следующий (→)">›</button>
+              </div>
+            </div>
             <div class="viewer" id="viewer">
               <template v-if="selectedFile">
                 <video v-if="selectedFile.type === 'video'" ref="videoRef"
@@ -961,7 +1240,7 @@ const App = {
                 <div v-else class="empty">Неизвестный тип файла.</div>
               </template>
               <div v-else class="empty">
-                <div class="icon">📂</div>Выберите файл на вкладке «Файлы».
+                <div class="icon">📂</div>Выберите файл слева или на вкладке «Файлы».
               </div>
             </div>
 
@@ -973,12 +1252,13 @@ const App = {
 
             <div v-if="selectedFile?.type === 'image'" class="tool-row">
               <span class="label">Инструмент:</span>
-              <select v-model="tool" style="flex: 0 1 130px;">
+              <select v-model="tool" style="flex: 0 1 140px;">
                 <option value="bbox">📦 BBox</option>
-                <option value="polygon">⬡ Полигон (сегментация)</option>
+                <option value="polygon">⬡ Полигон</option>
               </select>
               <span class="label">Класс:</span>
-              <input v-model="shapeClass" style="flex: 0 1 120px;">
+              <input v-model="shapeClass" list="class-options"
+                     style="flex: 0 1 140px;" placeholder="имя класса">
               <span class="label">Формат:</span>
               <select v-model="exportFormat" style="flex: 0 1 110px;">
                 <option value="yolo">YOLO</option>
@@ -992,10 +1272,11 @@ const App = {
                       @click="cancelPolygon" class="ghost">Отмена</button>
             </div>
             <p v-if="selectedFile?.type === 'image' && tool === 'polygon'" class="hint">
-              Кликайте, чтобы добавлять точки. Двойной клик или клик по первой точке — закрыть полигон. ESC — отменить.
+              Кликайте, чтобы добавлять точки. Двойной клик или клик по первой точке — закрыть. ESC — отменить.
             </p>
           </div>
 
+          <!-- RIGHT: layers + classes + Q&A -->
           <div class="card">
             <h2>Слои <span class="badge-pill">{{ shapes.length }}</span></h2>
             <p v-if="!shapes.length" class="hint">Нарисуйте bbox или полигон на изображении.</p>
@@ -1003,18 +1284,33 @@ const App = {
               <li v-for="(s, i) in shapes" :key="i" class="layer-row"
                   @mouseenter="highlightShape(i)" @mouseleave="unhighlight()">
                 <span class="layer-color" :style="{ background: colorFor(i) }"></span>
-                <span class="layer-info">
-                  <strong>{{ s.kind === 'polygon' ? '⬡' : '□' }} {{ s.class }}</strong>
-                  <span class="muted small">
-                    {{ s.kind === 'polygon' ? s.points.length + ' точек' :
-                       Math.round(Math.abs(s.x2-s.x1)) + '×' + Math.round(Math.abs(s.y2-s.y1)) }}
-                  </span>
+                <span class="layer-kind">{{ s.kind === 'polygon' ? '⬡' : '□' }}</span>
+                <input class="layer-class" list="class-options"
+                       :value="s.class"
+                       @change="onLayerClassChange(i, $event.target.value)"
+                       @click.stop
+                       title="Кликните, чтобы переименовать класс">
+                <span class="layer-size muted small">
+                  {{ s.kind === 'polygon' ? s.points.length + 'pt' :
+                     Math.round(Math.abs(s.x2-s.x1)) + '×' + Math.round(Math.abs(s.y2-s.y1)) }}
                 </span>
-                <button class="danger small-btn" @click="removeShape(i)" title="Удалить слой">×</button>
+                <button class="danger small-btn" @click.stop="removeShape(i)" title="Удалить слой">×</button>
               </li>
             </ul>
             <button v-if="shapes.length" @click="clearShapes" class="ghost"
-                    style="width: 100%; margin-top: 10px;">Удалить все слои</button>
+                    style="width: 100%; margin-top: 8px;">Удалить все слои</button>
+
+            <div v-if="usedClasses.length" style="margin-top: 14px;">
+              <h2>Классы в кадре</h2>
+              <ul class="class-list">
+                <li v-for="c in usedClasses" :key="c.name" class="class-row">
+                  <span class="class-name">{{ c.name }}</span>
+                  <span class="badge-pill">{{ c.count }}</span>
+                  <button class="ghost small-btn" @click="renameClass(c.name)"
+                          title="Переименовать все слои этого класса">✎</button>
+                </li>
+              </ul>
+            </div>
 
             <h2 style="margin-top: 18px;">Q&A</h2>
             <form id="annotate-form" @submit="submitAnnotation">
@@ -1039,24 +1335,197 @@ const App = {
 
       <!-- ====== COOP ====== -->
       <div v-show="activeTab === 'coop'">
-        <div class="grid cols-2">
-          <div class="card">
-            <h2>Параметры</h2>
-            <label>Тип:</label>
-            <select v-model="coopType">
-              <option value="coop">CoOp</option>
-              <option value="cocoop">CoCoOp</option>
-            </select>
-            <label>num_vectors:</label>
-            <input type="number" v-model.number="coopNumVectors" min="1" max="64">
-            <label>context_init:</label>
-            <input v-model="coopContextInit">
-            <button id="coop-train-btn" @click="trainCoop">Запустить</button>
-            <p v-if="coopRunId" class="hint">run_id: <code>{{ coopRunId }}</code></p>
+        <!-- Theory -->
+        <div class="card coop-theory">
+          <div class="row between" style="align-items:flex-start;">
+            <div>
+              <h2 style="margin:0 0 6px;">Что такое CoOp / CoCoOp</h2>
+              <p class="hint" style="margin:0 0 4px;">
+                Метод <strong>Context Optimization</strong> заменяет ручной шаблон
+                «<code>a photo of a [CLASS]</code>» на <em>обучаемые</em> токены-векторы
+                <code>[V]_1 … [V]_M [CLASS]</code>. Веса самой модели (CLIP / VLM) заморожены —
+                учатся только M непрерывных эмбеддингов. CoCoOp дополнительно использует
+                Meta-Net <code>h_θ(x)</code>, который сдвигает контекст в зависимости от
+                конкретного изображения, что улучшает обобщение на unseen-классы.
+              </p>
+            </div>
+            <button class="ghost" @click="coopShowTheory = !coopShowTheory">
+              {{ coopShowTheory ? 'Свернуть' : 'Подробнее' }}
+            </button>
           </div>
+          <div v-show="coopShowTheory" class="theory-body">
+            <div class="grid cols-2">
+              <div>
+                <h3>CoOp</h3>
+                <pre class="formula">prompt(c) = [V]_1 [V]_2 … [V]_M [CLASS_c]</pre>
+                <ul class="theory-list">
+                  <li><b>num_vectors (M)</b> — длина обучаемого контекста (обычно 4–16).</li>
+                  <li><b>context_init</b> — слова-инициализация (берутся эмбеддинги токенов CLIP).</li>
+                  <li><b>class_token_position</b> — позиция [CLASS] (end / front / middle).</li>
+                  <li>Loss: cross-entropy по cosine-similarity между текст- и image-эмбеддингами.</li>
+                </ul>
+              </div>
+              <div>
+                <h3>CoCoOp</h3>
+                <pre class="formula">[V]_m(x) = [V]_m + h_θ(image_features(x))</pre>
+                <ul class="theory-list">
+                  <li><b>net_depth</b> — число слоёв MLP в Meta-Net <code>h_θ</code>.</li>
+                  <li>Контекст становится <em>условным</em> от изображения, что снижает overfitting.</li>
+                  <li>Лучше обобщается на новые классы, домены и сдвиги распределения.</li>
+                  <li>Стоимость: ≈+5–10 % параметров и времени обучения.</li>
+                </ul>
+              </div>
+            </div>
+            <p class="hint" style="margin-top:10px;">
+              Источник: Zhou et al., <i>Conditional Prompt Learning for Vision-Language Models</i> (CVPR 2022,
+              <a href="https://arxiv.org/abs/2203.05557" target="_blank">arXiv 2203.05557</a>).
+              Эталонный код — <a href="https://github.com/KaiyangZhou/CoOp" target="_blank">KaiyangZhou/CoOp</a>.
+            </p>
+          </div>
+        </div>
+
+        <div class="grid coop-grid">
+          <!-- LEFT: setup -->
           <div class="card">
-            <h2>Лог</h2>
-            <pre class="log">{{ coopLog }}</pre>
+            <h2>Параметры обучения</h2>
+
+            <div class="model-banner" :class="coopSupported ? 'ok' : 'warn'">
+              <div>
+                <strong>Модель:</strong> {{ selectedModel || '—' }}
+              </div>
+              <div v-if="coopModelInfo">
+                <span class="muted small">{{ coopModelInfo.type }} · {{ (coopModelInfo.modalities || []).join(', ') }}</span>
+              </div>
+              <div class="muted small">
+                CoOp поддержка: <strong>{{ coopSupported ? 'да' : 'нет (coop_supported: true в YAML)' }}</strong>
+              </div>
+            </div>
+
+            <label>Метод:</label>
+            <select v-model="coopType">
+              <option value="coop">CoOp — статический обучаемый контекст</option>
+              <option value="cocoop">CoCoOp — условный, через Meta-Net</option>
+            </select>
+
+            <label>Датасет (.jsonl) <span class="muted small">— из datasets/ проекта</span>:</label>
+            <div class="row">
+              <select id="coop-dataset-select" v-model="coopDataset" class="grow"
+                      @click.capture="showHelpFor('#coop-dataset-select', $event)">
+                <option v-if="!coopDatasets.length" value="" disabled>(нет .jsonl)</option>
+                <option v-for="d in coopDatasets" :key="d.path" :value="d.name">
+                  {{ d.name }}{{ d.project ? ' · ' + d.project : ' · legacy' }}
+                </option>
+              </select>
+              <button class="ghost" @click="loadCoopDatasets" title="Обновить список">⟳</button>
+            </div>
+
+            <div class="grid cols-2" style="gap:10px;">
+              <div>
+                <label>num_vectors (M):</label>
+                <input id="coop-num-vectors" type="number" v-model.number="coopNumVectors"
+                       min="1" max="64"
+                       @click.capture="showHelpFor('#coop-num-vectors', $event)">
+              </div>
+              <div>
+                <label>class_token_position:</label>
+                <select id="coop-class-pos" v-model="coopClassPos"
+                        @click.capture="showHelpFor('#coop-class-pos', $event)">
+                  <option value="end">end</option>
+                  <option value="front">front</option>
+                  <option value="middle">middle</option>
+                </select>
+              </div>
+            </div>
+
+            <label>context_init:</label>
+            <input id="coop-context-init" v-model="coopContextInit" placeholder="a photo of a"
+                   @click.capture="showHelpFor('#coop-context-init', $event)">
+
+            <div v-if="coopType === 'cocoop'">
+              <label>net_depth (Meta-Net):</label>
+              <input id="coop-net-depth" type="number" v-model.number="coopNetDepth" min="1" max="8"
+                     @click.capture="showHelpFor('#coop-net-depth', $event)">
+            </div>
+
+            <div class="row" style="margin-top:10px;">
+              <button id="coop-train-btn" class="success grow"
+                      :disabled="!coopSupported || !coopDataset || coopStatus === 'running'"
+                      @click="trainCoop">
+                ▶ Запустить {{ coopType === 'cocoop' ? 'CoCoOp' : 'CoOp' }}
+              </button>
+              <button v-if="coopStatus === 'running'" class="danger" @click="cancelCoop">Прервать</button>
+            </div>
+
+            <p v-if="coopRunId" class="hint" style="margin-top:8px;">
+              run_id: <code>{{ coopRunId }}</code>
+              <span v-if="coopOutputDir"> · <code>{{ coopOutputDir }}</code></span>
+            </p>
+          </div>
+
+          <!-- CENTER: live status -->
+          <div class="card">
+            <div class="row between" style="margin-bottom: 8px;">
+              <h2 style="margin:0;">Текущий run</h2>
+              <span class="status-badge" :class="'st-' + coopStatus">
+                {{ fmtCoopStatus(coopStatus) }}
+              </span>
+            </div>
+
+            <div v-if="!coopRunId" class="muted" style="text-align:center; padding:30px;">
+              Запустите обучение или выберите run из истории справа.
+            </div>
+
+            <div v-else>
+              <div v-if="coopMetrics" class="metrics-grid">
+                <div v-for="(v, k) in coopMetrics" :key="k" class="metric-tile">
+                  <div class="metric-key">{{ k }}</div>
+                  <div class="metric-val">{{ typeof v === 'number' ? v : JSON.stringify(v) }}</div>
+                </div>
+              </div>
+
+              <h3 class="section-h">Лог</h3>
+              <pre class="log">{{ coopLog }}</pre>
+
+              <div class="row" style="margin-top:8px;">
+                <button id="coop-apply-btn" class="success"
+                        :disabled="!coopHasVectors"
+                        @click="applyCoopVectors"
+                        @click.capture="showHelpFor('#coop-apply-btn', $event)">
+                  Применить векторы к модели
+                </button>
+                <span v-if="!coopHasVectors" class="muted small">prompt_vectors.bin ещё не сохранён</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- RIGHT: history -->
+          <div class="card">
+            <div class="row between" style="margin-bottom: 8px;">
+              <h2 style="margin:0;">История <span class="badge-pill">{{ coopRuns.length }}</span></h2>
+              <button class="ghost" @click="loadCoopRuns" title="Обновить">⟳</button>
+            </div>
+            <p v-if="!coopRuns.length" class="hint">Запусков ещё не было.</p>
+            <ul class="run-list">
+              <li v-for="r in coopRuns" :key="r.run_id"
+                  class="run-row"
+                  :class="{ selected: coopRunId === r.run_id }"
+                  @click="selectCoopRun(r)">
+                <div class="run-head">
+                  <code class="run-id">{{ r.run_id }}</code>
+                  <span class="status-badge sm" :class="'st-' + r.status">
+                    {{ fmtCoopStatus(r.status) }}
+                  </span>
+                </div>
+                <div class="muted small run-meta">
+                  <span>{{ r.coop_type || '—' }} · M={{ r.num_vectors ?? '—' }}</span>
+                  <span v-if="r.model_name"> · {{ r.model_name }}</span>
+                </div>
+                <div v-if="r.metrics" class="muted small">
+                  <span v-if="r.metrics.final_accuracy != null">acc: {{ r.metrics.final_accuracy }}</span>
+                  <span v-else-if="r.metrics.final_loss != null">loss: {{ r.metrics.final_loss }}</span>
+                </div>
+              </li>
+            </ul>
           </div>
         </div>
       </div>

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import platform
 import shutil
 import uuid
@@ -54,13 +55,24 @@ from models.model_registry import (
     load_model_config,
     save_model_config,
 )
-from optimization.coop_trainer import get_coop_status, run_coop_training
+from optimization.coop_trainer import (
+    apply_learned_prompt,
+    cancel_coop_run,
+    get_coop_status,
+    list_coop_runs,
+    run_coop_training,
+)
 
 
 logger = logging.getLogger("autoprompt")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-app = FastAPI(title="AutoPrompt Annotator 5.0")
+# When the service runs behind a reverse proxy (JupyterHub / nginx), set
+# APP_ROOT_PATH to the proxy prefix, e.g. "/user/aveocr/proxy/5000".
+# This keeps OpenAPI/docs and redirects pointing at the proxied URL.
+ROOT_PATH = os.environ.get("APP_ROOT_PATH", "").rstrip("/")
+
+app = FastAPI(title="AutoPrompt Annotator 5.0", root_path=ROOT_PATH)
 
 UPLOADS_DIR = Path("storage/uploads")
 EXPORTS_DIR = Path("storage/exports")
@@ -102,6 +114,8 @@ async def _startup() -> None:
               Path("storage/datasets"), Path("storage/annotations")):
         d.mkdir(parents=True, exist_ok=True)
     project_store.ensure_default()
+    if ROOT_PATH:
+        logger.info("Сервис работает под префиксом proxy: %s", ROOT_PATH)
     if check_ffmpeg_available():
         logger.info("FFmpeg доступен в PATH")
     else:
@@ -498,6 +512,15 @@ async def models_min_examples(model_name: str):
     return {"min_examples": cfg.min_examples_for_soft_prompt}
 
 
+# ----------------- model info (full config dump) -----------------
+
+
+@app.get("/models/info/{model_name}")
+async def models_info(model_name: str):
+    cfg = load_model_config(model_name)
+    return cfg.model_dump()
+
+
 # ----------------- 14.15 image/bbox/save -----------------
 
 
@@ -605,14 +628,39 @@ class CoopTrainBody(_Body):
     context_init: str = "a photo of a"
     class_token_position: str = "end"
     net_depth: int = 3
+    project: Optional[str] = None
+
+
+def _resolve_dataset_path(dataset_name: str, project: Optional[str]) -> str:
+    """Find <name>.jsonl in project's datasets/, then in legacy
+    storage/datasets/. Accepts a name with or without .jsonl extension."""
+    fname = dataset_name if dataset_name.endswith(".jsonl") else f"{dataset_name}.jsonl"
+    if project and project_store.project_exists(project):
+        cand = project_store.project_paths(project)["datasets"] / fname
+        if cand.exists():
+            return str(cand)
+    legacy = Path("storage/datasets") / fname
+    return str(legacy)
 
 
 @app.post("/coop/train")
 async def coop_train(body: CoopTrainBody):
     cfg = load_model_config(body.model_name)
+    if not getattr(cfg, "coop_supported", False):
+        raise HTTPException(
+            400,
+            f"Модель «{cfg.name}» не поддерживает CoOp/CoCoOp "
+            f"(в YAML установите coop_supported: true).",
+        )
+    dataset_path = _resolve_dataset_path(body.dataset_name, body.project)
+    if not Path(dataset_path).exists():
+        raise HTTPException(
+            404,
+            f"Датасет не найден: {dataset_path}. "
+            f"Сначала завершите сессию разметки или укажите существующий .jsonl.",
+        )
     run_id = uuid.uuid4().hex[:12]
     output_dir = str(COOP_DIR / run_id)
-    dataset_path = str(Path("storage/datasets") / f"{body.dataset_name}.jsonl")
     info = await run_coop_training(
         model_config=cfg,
         dataset_path=dataset_path,
@@ -630,16 +678,82 @@ async def coop_train(body: CoopTrainBody):
 # ----------------- 14.18 coop/status -----------------
 
 
-@app.get("/coop/status/{run_id}")
-async def coop_status(run_id: str):
+def _output_dir_for_run(run_id: str) -> Optional[str]:
     output_dir = _coop_runs.get(run_id)
     if not output_dir:
         candidate = COOP_DIR / run_id
         if candidate.exists():
             output_dir = str(candidate)
+    return output_dir
+
+
+@app.get("/coop/status/{run_id}")
+async def coop_status(run_id: str):
+    output_dir = _output_dir_for_run(run_id)
     if not output_dir:
         raise HTTPException(404, "run_id не найден")
     return get_coop_status(output_dir)
+
+
+@app.get("/coop/runs")
+async def coop_runs_list(limit: int = 50):
+    return {"runs": list_coop_runs(limit=limit)}
+
+
+@app.post("/coop/cancel/{run_id}")
+async def coop_cancel(run_id: str):
+    output_dir = _output_dir_for_run(run_id)
+    if not output_dir:
+        raise HTTPException(404, "run_id не найден")
+    return await cancel_coop_run(output_dir)
+
+
+class CoopApplyBody(_Body):
+    model_name: str
+    run_id: str
+
+
+@app.post("/coop/apply")
+async def coop_apply(body: CoopApplyBody):
+    output_dir = _output_dir_for_run(body.run_id)
+    if not output_dir:
+        raise HTTPException(404, "run_id не найден")
+    vectors = Path(output_dir) / "prompt_vectors.bin"
+    if not vectors.exists():
+        raise HTTPException(400, "Векторы prompt_vectors.bin ещё не сохранены.")
+    cfg = load_model_config(body.model_name)
+    apply_learned_prompt(cfg, str(vectors))
+    return {"status": "ok", "vectors_path": str(vectors), "model": cfg.name}
+
+
+# ----------------- datasets list (for CoOp tab dropdown) -----------------
+
+
+@app.get("/datasets/list")
+async def datasets_list(project: Optional[str] = None):
+    """List available *.jsonl datasets in the active project and the
+    legacy storage/datasets/ folder."""
+    items: list[dict] = []
+    seen: set[str] = set()
+    if project and project_store.project_exists(project):
+        d = project_store.project_paths(project)["datasets"]
+        if d.exists():
+            for p in sorted(d.glob("*.jsonl")):
+                items.append({
+                    "name": p.stem, "path": str(p),
+                    "size": p.stat().st_size, "project": project,
+                })
+                seen.add(p.stem)
+    legacy = Path("storage/datasets")
+    if legacy.exists():
+        for p in sorted(legacy.glob("*.jsonl")):
+            if p.stem in seen:
+                continue
+            items.append({
+                "name": p.stem, "path": str(p),
+                "size": p.stat().st_size, "project": None,
+            })
+    return {"datasets": items}
 
 
 # ----------------- 14.19 benchmark/compare -----------------
