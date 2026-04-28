@@ -115,12 +115,18 @@ const App = {
     const answer = ref("");
     const checkResult = ref(null);
 
-    // shapes (bbox + polygon)
+    // shapes (bbox + polygon) — coordinates are stored in IMAGE-NATURAL
+    // pixels (NOT canvas display pixels). Display-time scaling happens
+    // inside drawAll/hitTest. This keeps shapes consistent across
+    // window resizes, file switches, and disk round-trips.
     const shapes = reactive([]);   // [{kind:'bbox'|'polygon', class, x1,y1,x2,y2 OR points:[]}]
+    const shapesByFile = reactive({});  // file_id -> shapes snapshot
     const tool = ref("bbox");      // 'bbox' | 'polygon'
-    const drawing = ref(null);     // bbox draft
-    const polyDraft = reactive([]); // polygon draft points
-    const polyHover = ref(null);   // current mouse position for polygon
+    const drawing = ref(null);     // bbox draft (in image coords)
+    const polyDraft = reactive([]); // polygon draft points (in image coords)
+    const polyHover = ref(null);   // current mouse position (image coords)
+    const interaction = ref(null); // {type:'move'|'resize'|'vertex', shapeIdx, handle?, vertexIdx?, startImg, orig}
+    let suppressNextClick = false;
     const shapeClass = ref("object");
     const exportFormat = ref("yolo");
     const canvasRef = ref(null);
@@ -330,12 +336,36 @@ const App = {
       selectedFileId.value = null;
       shapes.splice(0, shapes.length);
       polyDraft.splice(0, polyDraft.length);
+      // Wipe per-file shape cache when switching projects
+      for (const k of Object.keys(shapesByFile)) delete shapesByFile[k];
       loadClassHistory(name);
-      // load existing files for this project
+      // load existing files for this project (in-memory registry)
       try {
         const r = await api(`/projects/${encodeURIComponent(name)}/files`);
         for (const f of r.files) files.push(f);
       } catch {}
+      // If the registry is empty (e.g. after server restart), pick up
+      // anything that lives on disk in <project>/uploads/.
+      if (!files.length) {
+        await rescanProject({ silent: true });
+      }
+    }
+
+    async function rescanProject(opts = {}) {
+      if (!activeProject.value) return;
+      try {
+        const r = await api(
+          `projects/${encodeURIComponent(activeProject.value)}/rescan`,
+          { method: "POST" },
+        );
+        for (const f of r.added) files.push(f);
+        if (!opts.silent) {
+          if (r.added_count) setNotice(`Добавлено с диска: ${r.added_count}`);
+          else setNotice("Новых файлов на диске нет");
+        }
+      } catch (e) {
+        if (!opts.silent) setError(e.message);
+      }
     }
     watch(activeProject, (v, old) => { if (v && v !== old) selectProject(v); });
 
@@ -428,21 +458,72 @@ const App = {
       for (const id of ids) await removeFile(id, { skipConfirm: true });
     }
 
-    function selectFile(fileId) {
+    function snapshotCurrentShapes() {
+      // Persist current shapes back into the per-file cache so they
+      // survive a switch to another file.
+      if (selectedFileId.value == null) return;
+      shapesByFile[selectedFileId.value] = shapes.map(cloneShape);
+    }
+
+    async function selectFile(fileId) {
+      // 1) Persist the shapes of the currently-open file before switching.
+      snapshotCurrentShapes();
       selectedFileId.value = fileId;
       activeTab.value = "annotate";
-      shapes.splice(0, shapes.length);
       drawing.value = null;
+      interaction.value = null;
       polyDraft.splice(0, polyDraft.length);
       checkResult.value = null;
+      shapes.splice(0, shapes.length);
+
+      // 2) Load text content for text files
       const f = files.find(x => x.file_id === fileId);
       if (f?.type === "text") {
         fetch(fileURL(fileId)).then(r => r.text()).then(t => textContent.value = t);
-      } else { textContent.value = ""; }
+      } else {
+        textContent.value = "";
+      }
+
+      // 3) Restore shapes for this file: in-memory cache wins, then
+      //    fall back to whatever already exists in the project's
+      //    annotations/ folder on disk.
+      let cached = shapesByFile[fileId];
+      if (!cached && f?.type === "image") {
+        try {
+          const proj = activeProject.value || "";
+          const r = await api(`image/shapes/${fileId}?project=${encodeURIComponent(proj)}`);
+          if (r.shapes && r.shapes.length) {
+            cached = r.shapes.map(cloneShape);
+            shapesByFile[fileId] = cached;
+            for (const s of cached) recordClass(s.class);
+            setNotice(`Загружена существующая разметка (${r.format}, ${cached.length} слоёв)`);
+          }
+        } catch { /* nothing to load — first time */ }
+      }
+      if (cached) for (const s of cached) shapes.push(cloneShape(s));
+
       nextTick(syncCanvasSize);
     }
 
-    // ----- canvas drawing -----
+    // ----- canvas helpers (image-coord centric) -----
+    function imgScale() {
+      const img = imageRef.value;
+      if (!img || !img.naturalWidth || !img.clientWidth) return { sx: 1, sy: 1 };
+      return {
+        sx: img.clientWidth / img.naturalWidth,
+        sy: img.clientHeight / img.naturalHeight,
+      };
+    }
+
+    function evtToImg(e) {
+      const canvas = canvasRef.value;
+      if (!canvas) return [0, 0];
+      const r = canvas.getBoundingClientRect();
+      const cx = e.clientX - r.left, cy = e.clientY - r.top;
+      const { sx, sy } = imgScale();
+      return [cx / (sx || 1), cy / (sy || 1)];
+    }
+
     function syncCanvasSize() {
       const img = imageRef.value, canvas = canvasRef.value;
       if (!img || !canvas) return;
@@ -453,35 +534,117 @@ const App = {
       }
     }
 
-    function drawShape(ctx, s, idx, isHover = false) {
+    // ---- hit-testing ----
+    const HANDLE_R_CSS = 8;  // grab tolerance in display px
+
+    function bboxHandles(s) {
+      const xs = [Math.min(s.x1, s.x2), (s.x1 + s.x2) / 2, Math.max(s.x1, s.x2)];
+      const ys = [Math.min(s.y1, s.y2), (s.y1 + s.y2) / 2, Math.max(s.y1, s.y2)];
+      return [
+        ["nw", xs[0], ys[0]], ["n", xs[1], ys[0]], ["ne", xs[2], ys[0]],
+        ["w",  xs[0], ys[1]],                       ["e", xs[2], ys[1]],
+        ["sw", xs[0], ys[2]], ["s", xs[1], ys[2]], ["se", xs[2], ys[2]],
+      ];
+    }
+
+    function pointInPolygon(px, py, points) {
+      let inside = false;
+      for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+        const xi = points[i][0], yi = points[i][1];
+        const xj = points[j][0], yj = points[j][1];
+        const intersect = ((yi > py) !== (yj > py)) &&
+          (px < (xj - xi) * (py - yi) / ((yj - yi) || 1e-9) + xi);
+        if (intersect) inside = !inside;
+      }
+      return inside;
+    }
+
+    function hitTest(imgX, imgY) {
+      const { sx, sy } = imgScale();
+      const tol = HANDLE_R_CSS / Math.min(sx || 1, sy || 1);
+      // Top-most first
+      for (let i = shapes.length - 1; i >= 0; i--) {
+        const s = shapes[i];
+        if (s.kind === "bbox") {
+          for (const [name, hx, hy] of bboxHandles(s)) {
+            if (Math.hypot(imgX - hx, imgY - hy) <= tol)
+              return { shapeIdx: i, kind: "handle", handle: name };
+          }
+          if (imgX >= Math.min(s.x1, s.x2) && imgX <= Math.max(s.x1, s.x2) &&
+              imgY >= Math.min(s.y1, s.y2) && imgY <= Math.max(s.y1, s.y2))
+            return { shapeIdx: i, kind: "body" };
+        } else if (s.kind === "polygon") {
+          for (let v = 0; v < s.points.length; v++) {
+            const [px, py] = s.points[v];
+            if (Math.hypot(imgX - px, imgY - py) <= tol)
+              return { shapeIdx: i, kind: "vertex", vertexIdx: v };
+          }
+          if (pointInPolygon(imgX, imgY, s.points))
+            return { shapeIdx: i, kind: "body" };
+        }
+      }
+      return null;
+    }
+
+    function cloneShape(s) {
+      if (s.kind === "polygon") return { ...s, points: s.points.map(p => [...p]) };
+      return { ...s };
+    }
+
+    // ---- drawing ----
+    function drawShape(ctx, s, idx, isHover, sx, sy) {
       const color = colorFor(idx);
       ctx.strokeStyle = color;
       ctx.fillStyle = color;
       ctx.lineWidth = isHover ? 3 : 2;
       ctx.setLineDash([]);
+
       if (s.kind === "bbox") {
-        ctx.strokeRect(s.x1, s.y1, s.x2 - s.x1, s.y2 - s.y1);
-        const w = ctx.measureText(s.class).width + 8;
-        ctx.fillRect(s.x1, s.y1 - 18, w, 18);
+        const x = Math.min(s.x1, s.x2) * sx, y = Math.min(s.y1, s.y2) * sy;
+        const w = Math.abs(s.x2 - s.x1) * sx, h = Math.abs(s.y2 - s.y1) * sy;
+        ctx.strokeRect(x, y, w, h);
+        const tw = ctx.measureText(s.class).width + 8;
+        ctx.fillRect(x, y - 18, tw, 18);
         ctx.fillStyle = "white";
-        ctx.fillText(s.class, s.x1 + 4, s.y1 - 4);
+        ctx.fillText(s.class, x + 4, y - 4);
+        // handles
+        ctx.fillStyle = "white";
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        for (const [, hx, hy] of bboxHandles(s)) {
+          const cx = hx * sx, cy = hy * sy;
+          ctx.beginPath();
+          ctx.rect(cx - 4, cy - 4, 8, 8);
+          ctx.fill();
+          ctx.stroke();
+        }
       } else if (s.kind === "polygon") {
         if (!s.points?.length) return;
         ctx.beginPath();
-        ctx.moveTo(s.points[0][0], s.points[0][1]);
-        for (let i = 1; i < s.points.length; i++) ctx.lineTo(s.points[i][0], s.points[i][1]);
+        ctx.moveTo(s.points[0][0] * sx, s.points[0][1] * sy);
+        for (let i = 1; i < s.points.length; i++)
+          ctx.lineTo(s.points[i][0] * sx, s.points[i][1] * sy);
         ctx.closePath();
         ctx.stroke();
         ctx.save();
         ctx.globalAlpha = 0.18;
         ctx.fill();
         ctx.restore();
-        // class label at first point
         const [x, y] = s.points[0];
-        const w = ctx.measureText(s.class).width + 8;
-        ctx.fillRect(x, y - 18, w, 18);
+        const tw = ctx.measureText(s.class).width + 8;
+        ctx.fillRect(x * sx, y * sy - 18, tw, 18);
         ctx.fillStyle = "white";
-        ctx.fillText(s.class, x + 4, y - 4);
+        ctx.fillText(s.class, x * sx + 4, y * sy - 4);
+        // vertex handles
+        ctx.fillStyle = "white";
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        for (const [px, py] of s.points) {
+          ctx.beginPath();
+          ctx.arc(px * sx, py * sy, 5, 0, 2 * Math.PI);
+          ctx.fill();
+          ctx.stroke();
+        }
       }
     }
 
@@ -491,73 +654,171 @@ const App = {
       const ctx = canvas.getContext("2d");
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.font = "13px sans-serif";
-      shapes.forEach((s, i) => drawShape(ctx, s, i, i === hoverIdx));
-      // bbox draft
+      const { sx, sy } = imgScale();
+      shapes.forEach((s, i) => drawShape(ctx, s, i, i === hoverIdx, sx, sy));
+      // bbox draft (image coords → canvas)
       if (drawing.value) {
         const d = drawing.value;
         ctx.strokeStyle = "#3b82f6";
         ctx.setLineDash([4, 4]);
-        ctx.strokeRect(d.x1, d.y1, d.x2 - d.x1, d.y2 - d.y1);
+        ctx.strokeRect(d.x1 * sx, d.y1 * sy, (d.x2 - d.x1) * sx, (d.y2 - d.y1) * sy);
         ctx.setLineDash([]);
       }
-      // polygon draft
       if (polyDraft.length) {
         ctx.strokeStyle = "#3b82f6";
         ctx.setLineDash([4, 4]);
         ctx.beginPath();
-        ctx.moveTo(polyDraft[0][0], polyDraft[0][1]);
-        for (let i = 1; i < polyDraft.length; i++) ctx.lineTo(polyDraft[i][0], polyDraft[i][1]);
-        if (polyHover.value) ctx.lineTo(polyHover.value[0], polyHover.value[1]);
+        ctx.moveTo(polyDraft[0][0] * sx, polyDraft[0][1] * sy);
+        for (let i = 1; i < polyDraft.length; i++)
+          ctx.lineTo(polyDraft[i][0] * sx, polyDraft[i][1] * sy);
+        if (polyHover.value)
+          ctx.lineTo(polyHover.value[0] * sx, polyHover.value[1] * sy);
         ctx.stroke();
         ctx.setLineDash([]);
-        // dots
         ctx.fillStyle = "#3b82f6";
         for (const [x, y] of polyDraft) {
-          ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fill();
+          ctx.beginPath(); ctx.arc(x * sx, y * sy, 4, 0, Math.PI * 2); ctx.fill();
         }
       }
     }
 
-    function onCanvasMouseDown(e) {
-      if (tool.value !== "bbox") return;
-      const r = canvasRef.value.getBoundingClientRect();
-      drawing.value = { x1: e.clientX - r.left, y1: e.clientY - r.top, x2: 0, y2: 0 };
+    // ---- mouse interactions: drag / resize / draw new ----
+    function setCanvasCursor(c) {
+      if (canvasRef.value) canvasRef.value.style.cursor = c;
     }
-    function onCanvasMouseMove(e) {
-      const r = canvasRef.value.getBoundingClientRect();
-      const x = e.clientX - r.left, y = e.clientY - r.top;
-      if (tool.value === "bbox" && drawing.value) {
-        drawing.value.x2 = x; drawing.value.y2 = y;
-        drawAll();
-      } else if (tool.value === "polygon" && polyDraft.length) {
-        polyHover.value = [x, y];
-        drawAll();
+
+    function onCanvasMouseDown(e) {
+      const [imgX, imgY] = evtToImg(e);
+      // Try grabbing an existing shape first (works in any tool).
+      const hit = hitTest(imgX, imgY);
+      if (hit) {
+        const s = shapes[hit.shapeIdx];
+        if (hit.kind === "handle") {
+          interaction.value = {
+            type: "resize", shapeIdx: hit.shapeIdx, handle: hit.handle,
+            startImg: [imgX, imgY], orig: cloneShape(s),
+          };
+        } else if (hit.kind === "vertex") {
+          interaction.value = {
+            type: "vertex", shapeIdx: hit.shapeIdx, vertexIdx: hit.vertexIdx,
+            startImg: [imgX, imgY], orig: cloneShape(s),
+          };
+        } else {
+          interaction.value = {
+            type: "move", shapeIdx: hit.shapeIdx,
+            startImg: [imgX, imgY], orig: cloneShape(s),
+          };
+        }
+        return;
+      }
+      // Empty space: tool-specific behaviour
+      if (tool.value === "bbox") {
+        drawing.value = { x1: imgX, y1: imgY, x2: imgX, y2: imgY };
+      }
+      // polygon: handled in onCanvasClick
+    }
+
+    function applyInteraction(it, imgX, imgY) {
+      const s = shapes[it.shapeIdx];
+      if (!s) return;
+      const dx = imgX - it.startImg[0], dy = imgY - it.startImg[1];
+      if (it.type === "move") {
+        if (s.kind === "bbox") {
+          s.x1 = it.orig.x1 + dx; s.y1 = it.orig.y1 + dy;
+          s.x2 = it.orig.x2 + dx; s.y2 = it.orig.y2 + dy;
+        } else {
+          for (let i = 0; i < s.points.length; i++) {
+            s.points[i][0] = it.orig.points[i][0] + dx;
+            s.points[i][1] = it.orig.points[i][1] + dy;
+          }
+        }
+      } else if (it.type === "resize") {
+        let { x1, y1, x2, y2 } = it.orig;
+        if (it.handle.includes("w")) x1 = it.orig.x1 + dx;
+        if (it.handle.includes("e")) x2 = it.orig.x2 + dx;
+        if (it.handle.includes("n")) y1 = it.orig.y1 + dy;
+        if (it.handle.includes("s")) y2 = it.orig.y2 + dy;
+        s.x1 = x1; s.y1 = y1; s.x2 = x2; s.y2 = y2;
+      } else if (it.type === "vertex") {
+        s.points[it.vertexIdx][0] = it.orig.points[it.vertexIdx][0] + dx;
+        s.points[it.vertexIdx][1] = it.orig.points[it.vertexIdx][1] + dy;
       }
     }
+
+    function onCanvasMouseMove(e) {
+      const [imgX, imgY] = evtToImg(e);
+      if (interaction.value) {
+        applyInteraction(interaction.value, imgX, imgY);
+        drawAll();
+        return;
+      }
+      if (drawing.value) {
+        drawing.value.x2 = imgX; drawing.value.y2 = imgY;
+        drawAll();
+      } else if (polyDraft.length) {
+        polyHover.value = [imgX, imgY];
+        drawAll();
+      }
+      // hover cursor
+      const hit = hitTest(imgX, imgY);
+      if (hit?.kind === "handle") {
+        const map = {
+          nw: "nwse-resize", se: "nwse-resize",
+          ne: "nesw-resize", sw: "nesw-resize",
+          n: "ns-resize", s: "ns-resize",
+          e: "ew-resize", w: "ew-resize",
+        };
+        setCanvasCursor(map[hit.handle] || "pointer");
+      } else if (hit?.kind === "vertex") {
+        setCanvasCursor("pointer");
+      } else if (hit?.kind === "body") {
+        setCanvasCursor("move");
+      } else if (tool.value === "polygon") {
+        setCanvasCursor("copy");
+      } else {
+        setCanvasCursor("crosshair");
+      }
+    }
+
     function onCanvasMouseUp() {
-      if (tool.value !== "bbox" || !drawing.value) return;
+      if (interaction.value) {
+        interaction.value = null;
+        suppressNextClick = true;  // don't add a polygon vertex on release
+        return;
+      }
+      if (!drawing.value) return;
       const d = drawing.value;
       if (Math.abs(d.x2 - d.x1) > 4 && Math.abs(d.y2 - d.y1) > 4) {
         const cls = shapeClass.value || "object";
-        shapes.push({ kind: "bbox", class: cls, x1: d.x1, y1: d.y1, x2: d.x2, y2: d.y2 });
+        shapes.push({
+          kind: "bbox", class: cls,
+          x1: Math.min(d.x1, d.x2), y1: Math.min(d.y1, d.y2),
+          x2: Math.max(d.x1, d.x2), y2: Math.max(d.y1, d.y2),
+        });
         recordClass(cls);
       }
       drawing.value = null;
       drawAll();
     }
+
     function onCanvasClick(e) {
+      if (suppressNextClick) { suppressNextClick = false; return; }
       if (tool.value !== "polygon") return;
-      const r = canvasRef.value.getBoundingClientRect();
-      const x = e.clientX - r.left, y = e.clientY - r.top;
-      // close on click near first point
+      const [imgX, imgY] = evtToImg(e);
+      // Don't add a vertex if click landed on an existing shape (we'd
+      // be in a drag instead, but clicks on small shapes still fire).
+      if (hitTest(imgX, imgY)) return;
+      // Close polygon if user clicked near the first point
       if (polyDraft.length >= 3) {
         const [fx, fy] = polyDraft[0];
-        if (Math.hypot(x - fx, y - fy) < 10) {
+        const { sx, sy } = imgScale();
+        const tol = 10 / Math.min(sx || 1, sy || 1);
+        if (Math.hypot(imgX - fx, imgY - fy) < tol) {
           finishPolygon();
           return;
         }
       }
-      polyDraft.push([x, y]);
+      polyDraft.push([imgX, imgY]);
       drawAll();
     }
     function onCanvasDblClick() {
@@ -589,10 +850,7 @@ const App = {
       drawAll();
     }
 
-    function removeShape(idx) {
-      shapes.splice(idx, 1);
-      drawAll();
-    }
+    function removeShape(idx) { shapes.splice(idx, 1); drawAll(); }
     function clearShapes() {
       if (!shapes.length) return;
       if (!confirm(`Удалить все ${shapes.length} слоёв?`)) return;
@@ -604,17 +862,15 @@ const App = {
 
     async function saveShapes() {
       if (!selectedFile.value || !shapes.length) return setError("Нет слоёв для сохранения.");
-      const img = imageRef.value;
-      const sx = img.naturalWidth / img.clientWidth;
-      const sy = img.naturalHeight / img.clientHeight;
+      // shapes are already in image-natural coords — just round.
       const exportShapes = shapes.map(s => {
         if (s.kind === "polygon") {
-          return { class: s.class, points: s.points.map(([x, y]) => [Math.round(x * sx), Math.round(y * sy)]) };
+          return { class: s.class, points: s.points.map(([x, y]) => [Math.round(x), Math.round(y)]) };
         }
         return {
           class: s.class,
-          x1: Math.round(s.x1 * sx), y1: Math.round(s.y1 * sy),
-          x2: Math.round(s.x2 * sx), y2: Math.round(s.y2 * sy),
+          x1: Math.round(Math.min(s.x1, s.x2)), y1: Math.round(Math.min(s.y1, s.y2)),
+          x2: Math.round(Math.max(s.x1, s.x2)), y2: Math.round(Math.max(s.y1, s.y2)),
         };
       });
       try {
@@ -986,7 +1242,7 @@ const App = {
       // computed
       imageCount, videoCount,
       // methods
-      createProject, deleteProject, selectProject,
+      createProject, deleteProject, selectProject, rescanProject,
       pickFiles, onFileInputChange, onDrop, onDragOver, onDragLeave,
       uploadPaths, removeFile, clearAllFiles, selectFile,
       onCanvasMouseDown, onCanvasMouseMove, onCanvasMouseUp,
@@ -1118,9 +1374,19 @@ const App = {
           <div class="card">
             <div class="row between" style="margin-bottom: 8px;">
               <h2 style="margin: 0;">Файлы проекта <span class="badge-pill">{{ files.length }}</span></h2>
-              <button v-if="files.length" class="ghost" @click="clearAllFiles">Очистить всё</button>
+              <div class="row">
+                <button class="ghost" @click="rescanProject()" title="Подгрузить файлы с диска (uploads/)">
+                  ⟳ С диска
+                </button>
+                <button v-if="files.length" class="ghost" @click="clearAllFiles">Очистить всё</button>
+              </div>
             </div>
-            <p class="hint">Кнопка <b>×</b> удаляет файл с диска.</p>
+            <p class="hint">
+              Кликните «⟳ С диска» — подцепит файлы из
+              <code>storage/projects/{{ activeProject }}/uploads/</code>,
+              даже если они были оставлены вручную или сервер перезапустили.
+              Кнопка <b>×</b> удаляет файл с диска.
+            </p>
             <div v-if="!files.length" class="muted" style="text-align:center; padding: 30px;">
               Ещё ничего не загружено
             </div>

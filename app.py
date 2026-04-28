@@ -24,7 +24,11 @@ from pydantic import BaseModel, ConfigDict
 class _Body(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
-from annotation.image_bbox_annotator import save_bbox_annotation, save_shape_annotation
+from annotation.image_bbox_annotator import (
+    load_shape_annotation,
+    save_bbox_annotation,
+    save_shape_annotation,
+)
 from benchmark.comparator import compare_models
 from core import project_store
 from core.data_router import (
@@ -366,6 +370,36 @@ async def projects_files(name: str):
     return {"files": items}
 
 
+@app.post("/projects/{name}/rescan")
+async def projects_rescan(name: str):
+    """Walk `<project>/uploads/` on disk and register any files that are
+    not yet in the in-memory registry. Useful after a server restart or
+    when files were placed into the folder by hand.
+    """
+    if not project_store.project_exists(name):
+        raise HTTPException(404, f"Проект «{name}» не найден")
+    uploads = project_store.project_paths(name)["uploads"]
+    if not uploads.exists():
+        return {"added": [], "added_count": 0}
+    known_paths = {Path(rec["path"]).resolve() for rec in _uploaded_files.values()}
+    added: list[dict] = []
+    for p in sorted(uploads.iterdir()):
+        if not p.is_file():
+            continue
+        if p.resolve() in known_paths:
+            continue
+        fid = _register_file(str(p), name)
+        try:
+            ftype, meta = detect_file(str(p))
+        except Exception:
+            ftype, meta = "unknown", {}
+        added.append({
+            "file_id": fid, "path": str(p),
+            "type": ftype, "metadata": meta, "project": name,
+        })
+    return {"added": added, "added_count": len(added)}
+
+
 # ----------------- 14.6 annotate/next -----------------
 
 
@@ -571,6 +605,18 @@ async def image_shapes_save(body: ShapesSaveBody):
     out_dir = _annotations_dir_for(body.project, body.file_id)
     out = save_shape_annotation(path, body.shapes, body.format, output_dir=out_dir)
     return {"annotation_file": out, "count": len(body.shapes)}
+
+
+@app.get("/image/shapes/{file_id}")
+async def image_shapes_get(file_id: int, project: Optional[str] = None):
+    """Read existing annotation for the file (if any) and return shapes
+    in the same format the frontend uses. Coords are in image pixels.
+    """
+    path = _file_path(file_id)
+    if not path:
+        raise HTTPException(404, "Файл не найден")
+    out_dir = _annotations_dir_for(project, file_id)
+    return load_shape_annotation(path, output_dir=out_dir)
 
 
 # ----------------- 14.16 video/burn_timestamp -----------------

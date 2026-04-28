@@ -221,3 +221,132 @@ def save_bbox_annotation(
 ) -> str:
     """Backwards-compatible bbox-only API. Wraps `save_shape_annotation`."""
     return save_shape_annotation(image_path, boxes, format, output_dir)
+
+
+# ---------- LOADING (auto-display existing annotations) ----------
+
+def _load_coco(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"shapes": [], "format": None}
+    cats = {c["id"]: c["name"] for c in data.get("categories", [])}
+    shapes: list[dict] = []
+    for ann in data.get("annotations", []):
+        cls = cats.get(ann.get("category_id"), "object")
+        seg = ann.get("segmentation")
+        # Polygon: COCO segmentation is [[x1,y1,x2,y2,...]]
+        if isinstance(seg, list) and seg and isinstance(seg[0], list) and len(seg[0]) >= 6:
+            flat = seg[0]
+            points = [[float(flat[i]), float(flat[i + 1])] for i in range(0, len(flat) - 1, 2)]
+            shapes.append({"kind": "polygon", "class": cls, "points": points})
+            continue
+        bbox = ann.get("bbox")  # [x, y, w, h]
+        if isinstance(bbox, list) and len(bbox) == 4:
+            x, y, w, h = (float(v) for v in bbox)
+            shapes.append({
+                "kind": "bbox", "class": cls,
+                "x1": x, "y1": y, "x2": x + w, "y2": y + h,
+            })
+    return {"shapes": shapes, "format": "coco"}
+
+
+def _load_voc(path: Path) -> dict:
+    try:
+        root = ET.parse(path).getroot()
+    except Exception:
+        return {"shapes": [], "format": None}
+    shapes: list[dict] = []
+    for obj in root.findall("object"):
+        cls_el = obj.find("name")
+        cls = cls_el.text if cls_el is not None else "object"
+        # Polygon (custom <polygon><x1>..<xN>) — saved by us
+        poly_el = obj.find("polygon")
+        if poly_el is not None:
+            points: list[list[float]] = []
+            i = 1
+            while True:
+                xe = poly_el.find(f"x{i}")
+                ye = poly_el.find(f"y{i}")
+                if xe is None or ye is None:
+                    break
+                try:
+                    points.append([float(xe.text), float(ye.text)])
+                except (TypeError, ValueError):
+                    break
+                i += 1
+            if len(points) >= 3:
+                shapes.append({"kind": "polygon", "class": cls, "points": points})
+                continue
+        bb = obj.find("bndbox")
+        if bb is not None:
+            try:
+                x1 = float(bb.find("xmin").text); y1 = float(bb.find("ymin").text)
+                x2 = float(bb.find("xmax").text); y2 = float(bb.find("ymax").text)
+                shapes.append({"kind": "bbox", "class": cls, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+            except (AttributeError, TypeError, ValueError):
+                continue
+    return {"shapes": shapes, "format": "voc"}
+
+
+def _load_yolo(path: Path, out_dir: Path, image_path: Path) -> dict:
+    # Need image dimensions to denormalize coordinates
+    try:
+        with Image.open(image_path) as img:
+            W, H = img.size
+    except Exception:
+        return {"shapes": [], "format": None}
+    classes_txt = out_dir / "classes.txt"
+    classes: list[str] = []
+    if classes_txt.exists():
+        classes = [l.strip() for l in classes_txt.read_text(encoding="utf-8").splitlines() if l.strip()]
+    shapes: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.strip().split()
+        if len(parts) < 5:
+            continue
+        try:
+            cls_id = int(parts[0])
+            nums = [float(x) for x in parts[1:]]
+        except ValueError:
+            continue
+        cls = classes[cls_id] if 0 <= cls_id < len(classes) else f"class_{cls_id}"
+        if len(nums) == 4:
+            # bbox: x_center y_center w h (normalized)
+            xc, yc, w, h = nums
+            x1 = (xc - w / 2) * W; y1 = (yc - h / 2) * H
+            x2 = (xc + w / 2) * W; y2 = (yc + h / 2) * H
+            shapes.append({"kind": "bbox", "class": cls, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+        elif len(nums) >= 6 and len(nums) % 2 == 0:
+            # polygon: x1 y1 x2 y2 ... (normalized)
+            points = [[nums[i] * W, nums[i + 1] * H] for i in range(0, len(nums), 2)]
+            shapes.append({"kind": "polygon", "class": cls, "points": points})
+    return {"shapes": shapes, "format": "yolo"}
+
+
+def load_shape_annotation(
+    image_path: str,
+    output_dir: Optional[Path] = None,
+) -> dict:
+    """Look for an existing annotation file for `image_path` in
+    `output_dir` and return shapes in our internal format.
+
+    Search priority: COCO (.json) > VOC (.xml) > YOLO (.txt). The first
+    match wins. Coordinates are returned in image pixels.
+
+    Returns `{"shapes": [...], "format": "coco"|"voc"|"yolo"|None}`.
+    """
+    out_dir = Path(output_dir) if output_dir else DEFAULT_ANNOTATIONS_DIR
+    img = Path(image_path)
+    if not img.exists() or not out_dir.exists():
+        return {"shapes": [], "format": None}
+    coco_p = out_dir / f"{img.stem}.json"
+    if coco_p.exists():
+        return _load_coco(coco_p)
+    voc_p = out_dir / f"{img.stem}.xml"
+    if voc_p.exists():
+        return _load_voc(voc_p)
+    yolo_p = out_dir / f"{img.stem}.txt"
+    if yolo_p.exists():
+        return _load_yolo(yolo_p, out_dir, img)
+    return {"shapes": [], "format": None}
