@@ -40,8 +40,45 @@ HELP_TEXTS: dict[str, dict] = {
     "#coop-train-btn": {
         "title": "Запустить CoOp/CoCoOp",
         "description": "Генерирует скрипт обучения из шаблона и запускает его в "
-        "subprocess. Прогресс — в логе.",
+        "subprocess. Прогресс — в логе. Перед запуском убедитесь, что выбран "
+        "датасет и в YAML модели стоит coop_supported: true.",
         "example": "num_vectors=16, context_init='a photo of a'",
+    },
+    "#coop-num-vectors": {
+        "title": "Длина обучаемого контекста M",
+        "description": "Сколько токенов-векторов учим. Авторы CoOp экспериментируют "
+        "от 4 до 16; для классификации обычно достаточно 16.",
+        "example": "M = 16",
+    },
+    "#coop-context-init": {
+        "title": "Инициализация контекста",
+        "description": "Слова, эмбеддинги которых будут начальными значениями "
+        "обучаемых векторов. Хорошая инициализация ускоряет сходимость.",
+        "example": "a photo of a",
+    },
+    "#coop-class-pos": {
+        "title": "Позиция [CLASS] токена",
+        "description": "end — [V]_1...[V]_M [CLASS]; front — [CLASS] [V]_1...[V]_M; "
+        "middle — векторы по обе стороны от [CLASS]. По умолчанию end.",
+        "example": "end",
+    },
+    "#coop-net-depth": {
+        "title": "Глубина Meta-Net (только CoCoOp)",
+        "description": "Количество слоёв в маленьком MLP, который генерирует "
+        "сдвиг контекста по эмбеддингу изображения h_θ(x).",
+        "example": "depth = 3",
+    },
+    "#coop-dataset-select": {
+        "title": "Датасет для обучения",
+        "description": "Берётся .jsonl из datasets/ активного проекта. "
+        "Если пусто — завершите сессию разметки на вкладке «Разметка».",
+        "example": "dataset.jsonl",
+    },
+    "#coop-apply-btn": {
+        "title": "Применить выученный prompt",
+        "description": "Регистрирует файл prompt_vectors.bin как активный для "
+        "выбранной модели. Веса самой модели не меняются.",
+        "example": "",
     },
     "#benchmark-btn": {
         "title": "Бенчмарк",
